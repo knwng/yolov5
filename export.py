@@ -47,6 +47,7 @@ import json
 import os
 import platform
 import subprocess
+import yaml
 import sys
 import time
 import warnings
@@ -63,7 +64,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.common import Conv
+from models.common import Conv, DetectMultiBackend
 from models.experimental import attempt_load
 from models.yolo import Detect
 from utils.activations import SiLU
@@ -191,20 +192,24 @@ def export_coreml(model, im, file, prefix=colorstr('CoreML:')):
         return None, None
 
 
-def export_engine(model, im, file, train, half, simplify, workspace=4, verbose=False, prefix=colorstr('TensorRT:')):
+def export_engine(model, im, file, train, half, dynamic, optimization_profile, simplify, workspace=4, verbose=False, prefix=colorstr('TensorRT:')):
     # YOLOv5 TensorRT export https://developer.nvidia.com/tensorrt
     try:
         check_requirements(('tensorrt',))
         import tensorrt as trt
+        # model = model.to('cpu')
+        # im = im.to('cpu')
 
         if trt.__version__[0] == '7':  # TensorRT 7 handling https://github.com/ultralytics/yolov5/issues/6012
             grid = model.model[-1].anchor_grid
             model.model[-1].anchor_grid = [a[..., :1, :1, :] for a in grid]
-            export_onnx(model, im, file, 12, train, False, simplify)  # opset 12
+            # export_onnx(model, im, file, 12, train, False, simplify)  # opset 12
+            export_onnx(model, im, file, 12, train, dynamic, simplify)  # opset 12
             model.model[-1].anchor_grid = grid
         else:  # TensorRT >= 8
             check_version(trt.__version__, '8.0.0', hard=True)  # require tensorrt>=8.0.0
-            export_onnx(model, im, file, 13, train, False, simplify)  # opset 13
+            # export_onnx(model, im, file, 13, train, False, simplify)  # opset 13
+            export_onnx(model, im, file, 13, train, dynamic, simplify)  # opset 13
         onnx = file.with_suffix('.onnx')
 
         LOGGER.info(f'\n{prefix} starting export with TensorRT {trt.__version__}...')
@@ -233,6 +238,33 @@ def export_engine(model, im, file, train, half, simplify, workspace=4, verbose=F
         for out in outputs:
             LOGGER.info(f'{prefix}\toutput "{out.name}" with shape {out.shape} and dtype {out.dtype}')
 
+
+        # Support dynamic batch size
+        if dynamic:
+            # LOGGER.info(f'{prefix} Set Dynamic Batch Size [min, opt, max]: {batch_size_range}')
+            with open(optimization_profile, 'r') as f_yaml:
+                profile_settings = yaml.safe_load(f_yaml)
+            LOGGER.info(f'{prefix} Optimization profile settings loaded: \n{profile_settings}')
+            profile_dict = {setting['name']: setting for setting in profile_settings}
+            profile = builder.create_optimization_profile()
+            # _, ch, *imgsz = list(im.shape)
+
+            for i in range(network.num_inputs):
+                name = network.get_input(i).name
+                if name in profile_dict:
+                    LOGGER.info(f'{prefix} Set profile {profile_dict[name]} to input {name}')
+                    profile.set_shape(input=name,
+                        min=trt.tensorrt.Dims(shape=profile_dict[name]['shapes']['min']),
+                        opt=trt.tensorrt.Dims(shape=profile_dict[name]['shapes']['opt']),
+                        max=trt.tensorrt.Dims(shape=profile_dict[name]['shapes']['max']))
+
+            # min_dims = trt.tensorrt.Dims(shape=(batch_size_range[0], ch, *imgsz))
+            # opt_dims = trt.tensorrt.Dims(shape=(batch_size_range[1], ch, *imgsz))
+            # max_dims = trt.tensorrt.Dims(shape=(batch_size_range[2], ch, *imgsz))
+            # for i in range(network.num_inputs):
+            #     profile.set_shape(input=network.get_input(i).name, min=min_dims, opt=opt_dims, max=max_dims)
+            config.add_optimization_profile(profile)
+
         half &= builder.platform_has_fast_fp16
         LOGGER.info(f'{prefix} building FP{16 if half else 32} engine in {f}')
         if half:
@@ -242,7 +274,8 @@ def export_engine(model, im, file, train, half, simplify, workspace=4, verbose=F
         LOGGER.info(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
         return f
     except Exception as e:
-        LOGGER.info(f'\n{prefix} export failure: {e}')
+        # LOGGER.info(f'\n{prefix} export failure: {e}')
+        LOGGER.exception(f'\n{prefix} export failure: {e}')
 
 
 def export_saved_model(model, im, file, dynamic,
@@ -417,6 +450,8 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
         opset=12,  # ONNX: opset version
         verbose=False,  # TensorRT: verbose log
         workspace=4,  # TensorRT: workspace size (GB)
+        # batch_size_range=(1, 1, 1),  # TensorRT: dynamic batch size range
+        optimization_profile=None,  # TensorRT: path to optimization profile
         nms=False,  # TF: add NMS to model
         agnostic_nms=False,  # TF: add agnostic NMS to model
         topk_per_class=100,  # TF.js NMS: topk per class to keep
@@ -436,6 +471,8 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
     device = select_device(device)
     assert not (device.type == 'cpu' and half), '--half only compatible with GPU export, i.e. use --device 0'
     model = attempt_load(weights, map_location=device, inplace=True, fuse=True)  # load FP32 model
+    # print(f'Original Model:\n{model}')
+    # model = DetectMultiBackend(weights, device=device, dnn=False)
     nc, names = model.nc, model.names  # number of classes, class names
 
     # Checks
@@ -462,6 +499,9 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
             if hasattr(m, 'forward_export'):
                 m.forward = m.forward_export  # assign custom forward (optional)
 
+    # model = model.model
+    # print(f'Internal Model:\n{model}')
+
     for _ in range(2):
         y = model(im)  # dry runs
     shape = tuple(y[0].shape)  # model output shape
@@ -473,7 +513,11 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
     if 'torchscript' in include:
         f[0] = export_torchscript(model, im, file, optimize)
     if 'engine' in include:  # TensorRT required before ONNX
-        f[1] = export_engine(model, im, file, train, half, simplify, workspace, verbose)
+        if dynamic:
+            assert optimization_profile is not None, f'--optimization-profile should be set when export TensorRT model with dynamic shapes'
+            assert os.path.isfile(optimization_profile), f'{optimization_profile} is not a valid file path'
+            # assert len(batch_size_range) == 3, f'--batch-size-range should consist of 3 integer, representing min/opt/max batch-size'
+        f[1] = export_engine(model, im, file, train, half, dynamic, optimization_profile, simplify, workspace, verbose)
     if ('onnx' in include) or ('openvino' in include):  # OpenVINO requires ONNX
         f[2] = export_onnx(model, im, file, opset, train, dynamic, simplify)
     if 'openvino' in include:
@@ -525,6 +569,8 @@ def parse_opt():
     parser.add_argument('--optimize', action='store_true', help='TorchScript: optimize for mobile')
     parser.add_argument('--int8', action='store_true', help='CoreML/TF INT8 quantization')
     parser.add_argument('--dynamic', action='store_true', help='ONNX/TF: dynamic axes')
+    # parser.add_argument('--batch-size-range', nargs=3, type=int, default=(1, 1, 1), help='TensorRT: [min, opt, max] dimensions for input tensors with dynamic batch-size')
+    parser.add_argument('--optimization-profile', type=str, help='TensorRT: path to a yaml file describing the params for TensorRT optimization profile')
     parser.add_argument('--simplify', action='store_true', help='ONNX: simplify model')
     parser.add_argument('--opset', type=int, default=12, help='ONNX: opset version')
     parser.add_argument('--verbose', action='store_true', help='TensorRT: verbose log')
