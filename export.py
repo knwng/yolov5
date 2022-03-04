@@ -121,7 +121,7 @@ def export_onnx(model, im, file, opset, train, dynamic, simplify, prefix=colorst
 
         torch.onnx.export(model, im, f, verbose=False, opset_version=opset,
                           training=torch.onnx.TrainingMode.TRAINING if train else torch.onnx.TrainingMode.EVAL,
-                          do_constant_folding=not train,
+                          do_constant_folding=(not train) and (not dynamic),
                           input_names=['images'],
                           output_names=['output'],
                           dynamic_axes={'images': {0: 'batch', 2: 'height', 3: 'width'},  # shape(1,3,640,640)
@@ -197,8 +197,13 @@ def export_engine(model, im, file, train, half, dynamic, optimization_profile, s
     try:
         check_requirements(('tensorrt',))
         import tensorrt as trt
-        # model = model.to('cpu')
-        # im = im.to('cpu')
+        # if dynamic:
+        #     original_device = im.device
+        #     model = model.to('cpu')
+        #     im = im.to('cpu')
+
+        if half:
+            im, model = im.half(), model.half()  # to FP16
 
         if trt.__version__[0] == '7':  # TensorRT 7 handling https://github.com/ultralytics/yolov5/issues/6012
             grid = model.model[-1].anchor_grid
@@ -211,6 +216,10 @@ def export_engine(model, im, file, train, half, dynamic, optimization_profile, s
             # export_onnx(model, im, file, 13, train, False, simplify)  # opset 13
             export_onnx(model, im, file, 13, train, dynamic, simplify)  # opset 13
         onnx = file.with_suffix('.onnx')
+
+        # if dynamic:
+        #     model = model.to(original_device)
+        #     im = im.to(original_device)
 
         LOGGER.info(f'\n{prefix} starting export with TensorRT {trt.__version__}...')
         assert im.device.type != 'cpu', 'export running on CPU but must be on GPU, i.e. `python export.py --device 0`'
@@ -238,7 +247,6 @@ def export_engine(model, im, file, train, half, dynamic, optimization_profile, s
         for out in outputs:
             LOGGER.info(f'{prefix}\toutput "{out.name}" with shape {out.shape} and dtype {out.dtype}')
 
-
         # Support dynamic batch size
         if dynamic:
             # LOGGER.info(f'{prefix} Set Dynamic Batch Size [min, opt, max]: {batch_size_range}')
@@ -253,10 +261,10 @@ def export_engine(model, im, file, train, half, dynamic, optimization_profile, s
                 name = network.get_input(i).name
                 if name in profile_dict:
                     LOGGER.info(f'{prefix} Set profile {profile_dict[name]} to input {name}')
-                    profile.set_shape(input=name,
-                        min=trt.tensorrt.Dims(shape=profile_dict[name]['shapes']['min']),
-                        opt=trt.tensorrt.Dims(shape=profile_dict[name]['shapes']['opt']),
-                        max=trt.tensorrt.Dims(shape=profile_dict[name]['shapes']['max']))
+                    min_shape = profile_dict[name]['shapes']['min']
+                    opt_shape = profile_dict[name]['shapes']['opt']
+                    max_shape = profile_dict[name]['shapes']['max']
+                    profile.set_shape(input=name, min=min_shape, opt=opt_shape, max=max_shape)
 
             # min_dims = trt.tensorrt.Dims(shape=(batch_size_range[0], ch, *imgsz))
             # opt_dims = trt.tensorrt.Dims(shape=(batch_size_range[1], ch, *imgsz))
@@ -486,8 +494,6 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
     im = torch.zeros(batch_size, 3, *imgsz).to(device)  # image size(1,3,320,192) BCHW iDetection
 
     # Update model
-    if half:
-        im, model = im.half(), model.half()  # to FP16
     model.train() if train else model.eval()  # training mode = no Detect() layer grid construction
     for k, m in model.named_modules():
         if isinstance(m, Conv):  # assign export-friendly activations
@@ -499,8 +505,12 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
             if hasattr(m, 'forward_export'):
                 m.forward = m.forward_export  # assign custom forward (optional)
 
-    # model = model.model
-    # print(f'Internal Model:\n{model}')
+    model = model.to(device)
+
+    from collections import namedtuple
+    Weight = namedtuple('Weight', ('name', 'dtype', 'shape', 'data'))
+    model_params = {name[12:]: Weight(name=name[12:], dtype=param.type(), shape=list(param.size()), data=None) for name, param in model.named_parameters()}
+    print(f'{model_params=}')
 
     for _ in range(2):
         y = model(im)  # dry runs
@@ -510,14 +520,16 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
     # Exports
     f = [''] * 10  # exported filenames
     warnings.filterwarnings(action='ignore', category=torch.jit.TracerWarning)  # suppress TracerWarning
-    if 'torchscript' in include:
-        f[0] = export_torchscript(model, im, file, optimize)
     if 'engine' in include:  # TensorRT required before ONNX
         if dynamic:
             assert optimization_profile is not None, f'--optimization-profile should be set when export TensorRT model with dynamic shapes'
             assert os.path.isfile(optimization_profile), f'{optimization_profile} is not a valid file path'
             # assert len(batch_size_range) == 3, f'--batch-size-range should consist of 3 integer, representing min/opt/max batch-size'
         f[1] = export_engine(model, im, file, train, half, dynamic, optimization_profile, simplify, workspace, verbose)
+    if half:
+        im, model = im.half(), model.half()  # to FP16
+    if 'torchscript' in include:
+        f[0] = export_torchscript(model, im, file, optimize)
     if ('onnx' in include) or ('openvino' in include):  # OpenVINO requires ONNX
         f[2] = export_onnx(model, im, file, opset, train, dynamic, simplify)
     if 'openvino' in include:
